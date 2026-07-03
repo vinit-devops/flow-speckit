@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Tooling
+.uv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Flow SpecKit local state (embedded Postgres data dir, run scratch)
+.flow-speckit/
+
+# Claude Code harness state (worktrees)
+.claude/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+*.local.toml
