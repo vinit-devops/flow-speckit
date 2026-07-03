@@ -1,7 +1,8 @@
 [project]
 name = "flow-speckit"
-version = "0.1.0.dev0"
+version = "0.1.0.dev1"
 description = "Durable, artifact-driven AI-SDLC workflow orchestration"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
@@ -15,6 +16,11 @@ dependencies = [
   "structlog>=24.1",
   "deepdiff>=7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/vinit-devops/flow-speckit"
+Repository = "https://github.com/vinit-devops/flow-speckit"
+Documentation = "https://github.com/vinit-devops/flow-speckit/tree/main/docs/design"
 
 [project.optional-dependencies]
 embedded-pg = ["pgserver>=0.1.4"]

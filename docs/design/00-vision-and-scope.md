@@ -124,7 +124,7 @@ execution backends, git providers, notifiers, storage backends.
 | Template | Flow |
 |---|---|
 | `full-sdlc` | Idea → FrameBrief → gate → ProductArtifact → TechnicalDesign → gate → TaskPlan → execute → review → PR |
-| `feature` | RPIR: FrameBrief → gate → TechnicalDesign → gate → TaskPlan → Implement → ReviewReport → PR (the wedge demo) |
+| `feature` | Idea-to-PR: FrameBrief → gate → TechnicalDesign → gate → TaskPlan → Implement → ReviewReport → PR (the wedge demo) |
 | `bugfix` | Reproduce/diagnose → TaskPlan → gate → Implement → ReviewReport → PR |
 | `review-only` | Existing diff/PR → ReviewReport → sign-off gate (3 steps; the ceremony-free on-ramp) |
 
