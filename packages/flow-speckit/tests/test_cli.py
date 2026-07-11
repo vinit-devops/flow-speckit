@@ -8,6 +8,7 @@ from flow_speckit.artifacts.models import GenericArtifact
 from flow_speckit.artifacts.refs import ArtifactRef
 from flow_speckit.artifacts.registry import ArtifactRegistry, registry
 from flow_speckit.artifacts.store import ArtifactStore
+from flow_speckit.cli import artifacts_cmd
 from flow_speckit.cli.app import app
 
 
@@ -89,6 +90,47 @@ def test_list_entry_point_failure_exits_cleanly(  # type: ignore[no-untyped-def]
     assert result.exit_code == 1
     assert "Traceback" not in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_artifacts_list_and_show_exit_cleanly(  # type: ignore[no-untyped-def]
+    tmp_path, monkeypatch, migrated_url, seeded_artifact
+) -> None:
+    monkeypatch.setenv("FLOW_SPECKIT_DATABASE_URL", migrated_url)
+    monkeypatch.chdir(tmp_path)
+    listed = CliRunner().invoke(app, ["artifacts", "list"])
+    assert listed.exit_code == 0
+    shown = CliRunner().invoke(app, ["artifacts", "show", seeded_artifact.address])
+    assert shown.exit_code == 0
+
+
+class _StubSession:
+    async def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
+class _StubEngine:
+    def __init__(self) -> None:
+        self.disposed = False
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+async def test_open_store_disposes_engine_when_close_fails(  # type: ignore[no-untyped-def]
+    tmp_path, monkeypatch, migrated_url
+) -> None:
+    # Even if session.close() raises, the engine must still be disposed.
+    monkeypatch.setenv("FLOW_SPECKIT_DATABASE_URL", migrated_url)
+    monkeypatch.chdir(tmp_path)
+    engine = _StubEngine()
+    monkeypatch.setattr(artifacts_cmd, "create_engine", lambda url: engine)
+    monkeypatch.setattr(
+        artifacts_cmd, "session_factory", lambda eng: lambda: _StubSession()
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        async with artifacts_cmd._open_store():
+            pass
+    assert engine.disposed
 
 
 def test_init_entry_point_failure_exits_cleanly(  # type: ignore[no-untyped-def]

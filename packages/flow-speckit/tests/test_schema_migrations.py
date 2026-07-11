@@ -14,6 +14,11 @@ async def test_tables_exist(session: AsyncSession) -> None:
     assert {"artifacts", "artifact_edges", "artifact_types", "alembic_version"} <= names
 
 
+async def test_migration_head(session: AsyncSession) -> None:
+    rows = await session.execute(text("SELECT version_num FROM alembic_version"))
+    assert {r[0] for r in rows} == {"0003"}
+
+
 async def test_key_version_unique(session: AsyncSession) -> None:
     insert = text(
         "INSERT INTO artifacts (id, type, key, version, content, content_hash, schema_version) "

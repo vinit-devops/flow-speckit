@@ -1,3 +1,5 @@
+import importlib
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,6 +63,40 @@ def test_registry_collision_rules() -> None:
         reg.register(MemoB, source_package="pkg-b")
     reg.register(MemoB, source_package="local")  # local override allowed
     assert reg.get("memo") is MemoB
+
+
+def test_registry_installed_after_local_is_ignored() -> None:
+    reg = ArtifactRegistry()
+
+    class MemoLocal(ArtifactModel, artifact_type="memo"):
+        title: str
+
+    class MemoInstalled(ArtifactModel, artifact_type="memo"):
+        title: str
+
+    reg.register(MemoLocal, source_package="local")
+    # An installed package must not clobber the existing local registration.
+    reg.register(MemoInstalled, source_package="pkg-b")
+    assert reg.get("memo") is MemoLocal
+
+
+def test_load_entry_points_wraps_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenEntryPoint:
+        name = "broken"
+        value = "broken_pkg.module:BrokenArtifact"
+
+        def load(self) -> None:
+            raise ImportError("No module named 'broken_pkg'")
+
+    # The `flow_speckit.artifacts` package re-exports the `registry` *instance*,
+    # shadowing the submodule attribute, so fetch the module via importlib.
+    registry_module = importlib.import_module("flow_speckit.artifacts.registry")
+    monkeypatch.setattr(registry_module, "entry_points", lambda group: [BrokenEntryPoint()])
+    reg = ArtifactRegistry()
+    expected = r"'broken'.*broken_pkg\.module:BrokenArtifact"
+    with pytest.raises(RuntimeError, match=expected) as excinfo:
+        reg.load_entry_points()
+    assert isinstance(excinfo.value.__cause__, ImportError)
 
 
 def test_entry_points_load_generic() -> None:

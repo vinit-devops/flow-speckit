@@ -134,6 +134,15 @@ The engine wires `derived_from` edges automatically from declared skill inputs
 (doc 04 §3); `supersedes` is wired by the store on version bump; `implements`/`reviews`
 by the respective step types. Skills never write edges by hand.
 
+Rejected versions are **terminal** in the supersedes chain: on version bump the
+`supersedes` edge points from the new version to the previous **non-rejected**
+latest, skipping rejected rows, and a rejected row never receives a `supersedes`
+edge or a `superseded` status. Dedup likewise compares only against the latest
+non-rejected row — content identical to a rejected version still mints a new
+version — while version numbering counts all rows (including rejected ones) so
+numbers never collide. Codified in `store.create()` and the
+`test_create_after_rejected_*` tests.
+
 Query patterns (single recursive CTEs, no graph DB — see ADR-0003):
 
 ```sql
@@ -210,5 +219,6 @@ Skills see a **read-only** subset (`get`, `versions`, `lineage`, `search`, plus
 by capability, not convention.
 
 Status transitions are engine/gate-driven: `draft → proposed → approved | rejected`,
-any non-superseded status `→ superseded` on version bump. Gate approval of an artifact
+any non-superseded status **except `rejected`** `→ superseded` on version bump —
+`rejected` is terminal (§5). Gate approval of an artifact
 sets `approved` with the actor recorded in both the event log and the status change.

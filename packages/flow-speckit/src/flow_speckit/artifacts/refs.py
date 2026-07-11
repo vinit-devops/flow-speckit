@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel
-from sqlalchemy import Row
 
 from flow_speckit.artifacts.models import Status
+
+if TYPE_CHECKING:
+    from sqlalchemy import Row
 
 
 class ArtifactRef(BaseModel):
@@ -37,6 +39,16 @@ def row_to_ref(row: Row[Any]) -> ArtifactRef:
 
 
 def parse_ref(ref: str) -> UUID | tuple[str, int | None]:
+    """Parse an artifact reference into a UUID or a ``(key, version)`` pair.
+
+    Edge cases (current, intentional behavior — locked in by tests/test_refs.py):
+
+    - ``"@5"`` returns ``("", 5)``: the part before the last ``@`` is taken as
+      the key verbatim, even when empty.
+    - ``"foo@"`` returns ``("foo@", None)``: when the suffix after the last
+      ``@`` is not all digits, the *entire* input (including the trailing
+      ``@``) is treated as the key.
+    """
     try:
         return UUID(ref)
     except ValueError:

@@ -80,11 +80,23 @@ class ArtifactRegistry:
 
     def load_entry_points(self) -> None:
         for ep in entry_points(group="flow_speckit.artifacts"):
-            cls = ep.load()
+            try:
+                cls = ep.load()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load artifact type entry point {ep.name!r} "
+                    f"({ep.value}): {exc}"
+                ) from exc
             source_package = ep.dist.name if ep.dist is not None else ep.module
             self.register(cls, source_package=source_package)
 
     async def sync_to_db(self, session: AsyncSession) -> None:
+        """Upsert all registered types into the artifact_types table.
+
+        Note: this commits the session internally; if the workflow engine ever
+        becomes a second caller, transaction control should be extracted to
+        the callers instead.
+        """
         for registered in self._types.values():
             cls = registered.cls
             stmt = insert(artifact_types).values(

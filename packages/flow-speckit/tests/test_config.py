@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from flow_speckit.config import FlowSpeckitSettings, resolve_database_url
 
 
@@ -17,6 +19,14 @@ def test_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:  # type: ignor
 
 def test_missing_toml_is_fine(tmp_path: Path) -> None:
     assert FlowSpeckitSettings.load(tmp_path).database_url is None
+
+
+def test_malformed_toml_raises_friendly_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "flow-speckit.toml"
+    config_path.write_text("[database\nurl =")
+    with pytest.raises(ValueError, match="invalid TOML in config file") as excinfo:
+        FlowSpeckitSettings.load(tmp_path)
+    assert str(config_path) in str(excinfo.value)
 
 
 def test_resolve_explicit_url(tmp_path: Path) -> None:

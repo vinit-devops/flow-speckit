@@ -27,3 +27,16 @@ async def test_search_finds_body_text(store: ArtifactStore) -> None:
 async def test_search_type_filter(store: ArtifactStore) -> None:
     await store.create(GenericArtifact(title="CSV export"), key="d/csv")
     assert await store.search("csv", type="nonexistent") == []
+
+
+async def test_search_equal_rank_orders_by_id(store: ArtifactStore) -> None:
+    # Identical text under two keys ranks identically; the trailing `id`
+    # ORDER BY key must yield a stable id-ascending order on the tie.
+    r1 = await store.create(
+        GenericArtifact(title="Widget spec", body="rotary gadget"), key="d/one"
+    )
+    r2 = await store.create(
+        GenericArtifact(title="Widget spec", body="rotary gadget"), key="d/two"
+    )
+    hits = await store.search("widget")
+    assert [h.id for h in hits] == sorted([r1.id, r2.id])

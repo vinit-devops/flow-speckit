@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from flow_speckit.artifacts.refs import ArtifactRef
 from flow_speckit.artifacts.registry import registry
@@ -20,11 +21,13 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-async def _open_store() -> tuple[AsyncEngine, AsyncSession, ArtifactStore]:
-    """Build an (engine, session, store) triple from settings + the module registry.
+@contextlib.asynccontextmanager
+async def _open_store() -> AsyncIterator[ArtifactStore]:
+    """Yield an ArtifactStore built from settings + the module registry.
 
-    Callers own the returned engine/session and must dispose/close them
-    (typically in a `finally` block) once done.
+    Owns the engine and session lifecycles via nested try/finally: the engine
+    is disposed even if `session.close()` raises, and both cleanups run no
+    matter what the caller's body does.
     """
     root = Path.cwd()
     settings = FlowSpeckitSettings.load(root)
@@ -35,15 +38,21 @@ async def _open_store() -> tuple[AsyncEngine, AsyncSession, ArtifactStore]:
         raise typer.Exit(1) from exc
     # Load entry points BEFORE creating the engine: a failure here (e.g. a
     # RegistryCollisionError from a broken installed package) must not leak
-    # an engine that no caller finally-block has been given yet.
+    # an engine that no cleanup block has been given yet.
     try:
         registry.load_entry_points()
     except Exception as exc:
         err_console.print(f"error: failed to load artifact types: {exc}")
         raise typer.Exit(1) from exc
     engine = create_engine(url)
-    session = session_factory(engine)()
-    return engine, session, ArtifactStore(session, registry)
+    try:
+        session = session_factory(engine)()
+        try:
+            yield ArtifactStore(session, registry)
+        finally:
+            await session.close()
+    finally:
+        await engine.dispose()
 
 
 def _refs_table(refs: list[ArtifactRef]) -> Table:
@@ -66,13 +75,9 @@ def list_artifacts(
 
 
 async def _list_artifacts(type_: str | None) -> None:
-    engine, session, store = await _open_store()
-    try:
+    async with _open_store() as store:
         refs = await store.list(type=type_)
         console.print(_refs_table(refs))
-    finally:
-        await session.close()
-        await engine.dispose()
 
 
 @artifacts_app.command("show")
@@ -82,8 +87,7 @@ def show_artifact(ref: str) -> None:
 
 
 async def _show_artifact(ref: str) -> None:
-    engine, session, store = await _open_store()
-    try:
+    async with _open_store() as store:
         try:
             resolved = await store.resolve(ref)
             # Pin to the resolved row's id so both reads see the same version.
@@ -98,9 +102,6 @@ async def _show_artifact(ref: str) -> None:
         # Print the STORED body_md (canonical, written at create time) — never
         # a fresh render_md(), which may have changed since the write.
         console.print(Markdown(body_md or ""))
-    finally:
-        await session.close()
-        await engine.dispose()
 
 
 @artifacts_app.command("versions")
@@ -110,16 +111,12 @@ def versions_cmd(key: str) -> None:
 
 
 async def _versions(key: str) -> None:
-    engine, session, store = await _open_store()
-    try:
+    async with _open_store() as store:
         refs = await store.versions(key)
         if not refs:
             err_console.print(f"error: no versions found for key: {key}")
             raise typer.Exit(1)
         console.print(_refs_table(refs))
-    finally:
-        await session.close()
-        await engine.dispose()
 
 
 @artifacts_app.command("diff")
@@ -129,8 +126,7 @@ def diff_cmd(ref_a: str, ref_b: str) -> None:
 
 
 async def _diff(ref_a: str, ref_b: str) -> None:
-    engine, session, store = await _open_store()
-    try:
+    async with _open_store() as store:
         try:
             result = await store.diff(ref_a, ref_b)
         except ArtifactNotFound as exc:
@@ -147,6 +143,3 @@ async def _diff(ref_a: str, ref_b: str) -> None:
                 console.print(f"  {change_type}: {details}")
         else:
             console.print("  (none)")
-    finally:
-        await session.close()
-        await engine.dispose()

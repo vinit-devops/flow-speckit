@@ -1,6 +1,6 @@
 [project]
 name = "flow-speckit"
-version = "0.1.0.dev1"
+version = "0.1.0.post1"
 description = "Durable, artifact-driven AI-SDLC workflow orchestration"
 readme = "README.md"
 requires-python = ">=3.11"

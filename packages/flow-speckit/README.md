@@ -16,13 +16,13 @@ Durable, resumable workflows drive stateless AI skills and pluggable coding agen
 transition and every phase producing a versioned, lineage-linked artifact.
 
 > **Status: early development.** Phase 2 (Artifact Engine) is complete; Phase 3
-> (Workflow Engine) is in progress. This is a pre-release — the full wedge demo below
-> is the v0.1 target, not yet functional end to end.
+> (Workflow Engine) is in progress. The full wedge demo below is the v0.1 target,
+> not yet functional end to end.
 
 ## Install
 
 ```console
-pip install --pre flow-speckit
+pip install flow-speckit
 ```
 
 ## The wedge (v0.1 target demo)

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -58,12 +59,56 @@ async def test_get_missing_raises(store: ArtifactStore) -> None:
         await store.get("nope")
 
 
-async def test_list_newest_first_and_type_filter(store: ArtifactStore) -> None:
+async def test_get_as_of_version_exact_hit(store: ArtifactStore) -> None:
+    await store.create(GenericArtifact(title="v1"), key="notes/a")
+    await store.create(GenericArtifact(title="v2"), key="notes/a")
+    model = await store.get("notes/a", as_of_version=1)
+    assert isinstance(model, GenericArtifact) and model.title == "v1"
+
+
+async def test_get_as_of_version_missing_raises(
+    store: ArtifactStore, session: AsyncSession
+) -> None:
+    await store.create(GenericArtifact(title="v1"), key="notes/a")
+    with pytest.raises(ArtifactNotFound, match="notes/a@99"):
+        await store.get("notes/a", as_of_version=99)
+    # The read transaction must be released before raising.
+    assert not session.in_transaction()
+
+
+async def test_get_as_of_version_rejects_versioned_ref_and_uuid(
+    store: ArtifactStore, session: AsyncSession
+) -> None:
+    ref = await store.create(GenericArtifact(title="v1"), key="notes/a")
+    with pytest.raises(ValueError, match="already-versioned"):
+        await store.get("notes/a@1", as_of_version=1)
+    with pytest.raises(ValueError, match="UUID"):
+        await store.get(ref.id, as_of_version=1)
+    with pytest.raises(ValueError, match="UUID"):
+        await store.get(str(ref.id), as_of_version=1)
+    # Validation raises before any SELECT; no transaction may be left open.
+    assert not session.in_transaction()
+
+
+async def test_list_newest_first_and_type_filter(
+    store: ArtifactStore, session: AsyncSession
+) -> None:
     await store.create(GenericArtifact(title="A"), key="notes/a")
     await store.create(GenericArtifact(title="B"), key="notes/b")
     refs = await store.list()
     assert [r.key for r in refs] == ["notes/b", "notes/a"]
     assert await store.list(type="nonexistent") == []
+    # Rows tying on created_at fall back to version DESC: pin both versions
+    # of notes/b to one timestamp and expect the newer version first.
+    await store.create(GenericArtifact(title="B2"), key="notes/b")
+    await session.execute(
+        schema.artifacts.update()
+        .where(schema.artifacts.c.key == "notes/b")
+        .values(created_at=datetime(2020, 1, 1, tzinfo=UTC))
+    )
+    await session.commit()
+    b_versions = [r.version for r in await store.list() if r.key == "notes/b"]
+    assert b_versions == [2, 1]
 
 
 async def test_list_respects_limit(store: ArtifactStore) -> None:

@@ -16,6 +16,7 @@ from flow_speckit.artifacts.models import ArtifactModel, Relation, Status
 from flow_speckit.artifacts.refs import ArtifactRef, parse_ref, row_to_ref
 from flow_speckit.artifacts.registry import ArtifactRegistry
 from flow_speckit.storage import schema
+from flow_speckit.storage.locks import ARTIFACTS_LOCK_CLASS_ID
 
 logger = structlog.get_logger(__name__)
 
@@ -73,7 +74,8 @@ class ArtifactStore:
             # case, where there is no row to lock) with a transaction-scoped
             # advisory lock; it auto-releases on the commit/rollback below.
             await self._session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key}
+                text("SELECT pg_advisory_xact_lock(:class_id, hashtext(:key))"),
+                {"class_id": ARTIFACTS_LOCK_CLASS_ID, "key": key},
             )
             # Dedup only compares against the latest NON-rejected row: content
             # identical to a rejected version must still mint a new version.
@@ -126,8 +128,47 @@ class ArtifactStore:
         current_max = result.scalar_one_or_none()
         return 1 if current_max is None else current_max + 1
 
-    async def get(self, ref: str | UUID) -> ArtifactModel:
-        row = await self._get_row(ref)
+    async def get(
+        self, ref: str | UUID, *, as_of_version: int | None = None
+    ) -> ArtifactModel:
+        """Return the model for ``ref``, optionally pinned to an exact version.
+
+        ``as_of_version`` is the programmatic equivalent of a ``"key@N"``
+        ref: it is valid only with a bare-key ``ref`` and resolves that key
+        at exactly that version. Like ``_get_row``'s exact-version lookup,
+        it does not filter rejected rows. Combining ``as_of_version`` with
+        a UUID or an already-versioned ref (e.g. ``"key@3"``) raises
+        ``ValueError``; a missing version raises ``ArtifactNotFound``.
+        """
+        if as_of_version is not None:
+            # Validation happens before any SELECT, so there is no open
+            # transaction to release on these raises.
+            if isinstance(ref, UUID):
+                raise ValueError(
+                    "as_of_version cannot be combined with a UUID ref"
+                )
+            parsed = parse_ref(ref)
+            if isinstance(parsed, UUID):
+                raise ValueError(
+                    "as_of_version cannot be combined with a UUID ref"
+                )
+            key, version = parsed
+            if version is not None:
+                raise ValueError(
+                    "as_of_version cannot be combined with an "
+                    f"already-versioned ref {ref!r}"
+                )
+            # Name the exact address in any not-found error below.
+            ref = f"{key}@{as_of_version}"
+            result = await self._session.execute(
+                select(schema.artifacts).where(
+                    schema.artifacts.c.key == key,
+                    schema.artifacts.c.version == as_of_version,
+                )
+            )
+            row = result.first()
+        else:
+            row = await self._get_row(ref)
         if row is None:
             await self._end_read()
             raise ArtifactNotFound(str(ref))
@@ -196,10 +237,15 @@ class ArtifactStore:
 
     async def diff(self, ref_a: str | UUID, ref_b: str | UUID) -> ArtifactDiff:
         row_a = await self._get_row(ref_a)
-        row_b = await self._get_row(ref_b)
-        if row_a is None or row_b is None:
+        if row_a is None:
+            # Early exit: skip the second SELECT entirely, releasing the
+            # transaction opened by the first one before raising.
             await self._end_read()
-            raise ArtifactNotFound(str(ref_a) if row_a is None else str(ref_b))
+            raise ArtifactNotFound(str(ref_a))
+        row_b = await self._get_row(ref_b)
+        if row_b is None:
+            await self._end_read()
+            raise ArtifactNotFound(str(ref_b))
         # Read-only: release the transaction opened by the SELECTs above.
         await self._end_read()
         return compute_diff(
@@ -214,18 +260,19 @@ class ArtifactStore:
     async def search(
         self, query: str, *, type: str | None = None, limit: int = 50
     ) -> list[ArtifactRef]:
+        # Hoist the tsquery into a lateral FROM item so it is computed once
+        # and shared by the WHERE match and the ORDER BY rank expression.
         sql = (
             "SELECT id, type, key, version, status, content_hash, created_at "
-            "FROM artifacts "
-            "WHERE search_tsv @@ plainto_tsquery('english', :q)"
+            "FROM artifacts, plainto_tsquery('english', :q) AS tsq "
+            "WHERE search_tsv @@ tsq"
         )
         params: dict[str, Any] = {"q": query, "limit": limit}
         if type is not None:
             sql += " AND type = :type"
             params["type"] = type
-        sql += (
-            " ORDER BY ts_rank(search_tsv, plainto_tsquery('english', :q)) DESC LIMIT :limit"
-        )
+        # Trailing `id` makes ordering deterministic when rows tie on rank.
+        sql += " ORDER BY ts_rank(search_tsv, tsq) DESC, id LIMIT :limit"
         result = await self._session.execute(text(sql), params)
         rows = result.all()
         # Read-only: release the transaction opened by the SELECT above.
@@ -279,9 +326,14 @@ class ArtifactStore:
     ) -> list[ArtifactRef]:
         stmt = (
             select(schema.artifacts)
-            # Secondary key `id` makes ordering deterministic when rows share
-            # a created_at timestamp.
-            .order_by(schema.artifacts.c.created_at.desc(), schema.artifacts.c.id)
+            # Rows sharing a created_at timestamp fall back to version DESC
+            # (newest version first), with `id` as the final determinism
+            # guard for rows that also tie on version.
+            .order_by(
+                schema.artifacts.c.created_at.desc(),
+                schema.artifacts.c.version.desc(),
+                schema.artifacts.c.id,
+            )
             .limit(limit)
         )
         if type is not None:

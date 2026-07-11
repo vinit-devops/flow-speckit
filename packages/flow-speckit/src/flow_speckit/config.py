@@ -17,14 +17,22 @@ class FlowSpeckitSettings(BaseSettings):
         toml_values: dict[str, str] = {}
         config_path = root / "flow-speckit.toml"
         if config_path.exists():
-            data = tomllib.loads(config_path.read_text())
+            try:
+                data = tomllib.loads(config_path.read_text())
+            except tomllib.TOMLDecodeError as exc:
+                raise ValueError(
+                    f"invalid TOML in config file {config_path}: {exc}"
+                ) from exc
             url = data.get("database", {}).get("url")
             if url:
                 toml_values["database_url"] = url
-        env_only = cls()
-        if env_only.database_url is not None:
-            return env_only
-        return cls(**toml_values)
+        # Per-field precedence: env wins for any field it sets, toml fills the
+        # rest. Init kwargs outrank env vars in pydantic-settings, so only
+        # pass toml values for fields the environment did NOT set.
+        env_set_fields = cls().model_fields_set
+        return cls(
+            **{k: v for k, v in toml_values.items() if k not in env_set_fields}
+        )
 
 
 def resolve_database_url(settings: FlowSpeckitSettings, root: Path) -> str:
