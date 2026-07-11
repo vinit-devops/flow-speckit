@@ -56,9 +56,11 @@ from rich.console import Console
 from sqlalchemy import Row, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from flow_speckit.cli.skills_cmd import build_skill_registry
 from flow_speckit.config import FlowSpeckitSettings, resolve_database_url
 from flow_speckit.storage import schema
 from flow_speckit.storage.db import create_engine, session_factory
+from flow_speckit.workflows.builder import build_handlers
 from flow_speckit.workflows.engine import WorkflowEngine
 from flow_speckit.workflows.errors import (
     NonDeterminismError,
@@ -129,12 +131,16 @@ async def open_workflow_env(
         except Exception as exc:
             err_console.print(f"error: failed to load workflows: {exc}")
             raise typer.Exit(1) from exc
+    # Build the Phase 5 handler map: this is what wires skill/execute/open_pr
+    # steps to their respective subsystems (doc 03 §5, Phase 5).
+    handlers = build_handlers(settings, skill_registry=build_skill_registry(root))
     db = create_engine(url)
     try:
         sessions = session_factory(db)
         engine = WorkflowEngine(
             sessions,
             workflow_registry,
+            handlers=handlers,
             notify=make_notifier(sessions),
             auto_approve=auto_approve,
         )

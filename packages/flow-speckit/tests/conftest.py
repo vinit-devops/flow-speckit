@@ -32,6 +32,20 @@ async def engine(migrated_url: str) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture()
+async def db_session_factory(engine: AsyncEngine):
+    """Yield an ``async_sessionmaker`` for the migrated database with clean tables."""
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(
+                "TRUNCATE artifact_edges, artifacts, artifact_types, "
+                "workflow_events, workflow_runs, task_queue, timers CASCADE"
+            )
+        )
+        await conn.commit()
+    return session_factory(engine)
+
+
+@pytest.fixture()
 async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with engine.connect() as conn:
         await conn.execute(
