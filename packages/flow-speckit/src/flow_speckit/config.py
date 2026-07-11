@@ -24,7 +24,11 @@ class ExecutionConfig(BaseModel):
 
 
 class FlowSpeckitSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FLOW_SPECKIT_")
+    # Nested fields are env-settable via a double underscore, e.g.
+    # FLOW_SPECKIT_LLM__TIERS='{"fast": "..."}'.
+    model_config = SettingsConfigDict(
+        env_prefix="FLOW_SPECKIT_", env_nested_delimiter="__"
+    )
 
     database_url: str | None = None
     llm: LLMConfig = Field(default_factory=LLMConfig)

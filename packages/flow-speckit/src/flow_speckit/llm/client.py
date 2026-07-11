@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from flow_speckit.llm.tiers import Tier
+from flow_speckit.llm.tiers import LLMSpec, Tier, resolve_tier
 
 if TYPE_CHECKING:
     from flow_speckit.llm.assemble import AssembledContext
@@ -55,6 +55,11 @@ class LLMClient:
     Resolution per call: spec tier → per-skill override → tier map → model
     name. Structured output via ``response_model`` with one repair round-trip
     on validation failure, then ``SkillOutputError``.
+
+    Budgets are enforced pre-flight: a call is refused with
+    ``BudgetExceededError`` once the run has spent ``default_max_usd_per_run``
+    or the skill has spent its ``max_cost_usd`` — an in-flight completion is
+    never discarded after the money is already spent.
     """
 
     def __init__(
@@ -68,41 +73,45 @@ class LLMClient:
         self._overrides = dict(overrides or {})
         self._default_max_usd_per_run = default_max_usd_per_run
         self._total_cost_usd: float = 0.0
-        self._client: Any = None
+        self._cost_by_skill: dict[str, float] = {}
+        self._litellm: Any = None
 
     @property
     def total_cost_usd(self) -> float:
         return self._total_cost_usd
 
-    async def _ensure_client(self) -> Any:
-        if self._client is not None:
-            return self._client
+    def cost_for_skill(self, skill_name: str) -> float:
+        return self._cost_by_skill.get(skill_name, 0.0)
+
+    def _ensure_litellm(self) -> Any:
+        """Return the litellm module, or a ``_NullLLMClient`` when not installed."""
+        if self._litellm is not None:
+            return self._litellm
         try:
-            from litellm import Router  # type: ignore[import-untyped]
+            import litellm  # type: ignore[import-untyped]
         except ImportError:
-            return _NullLLMClient()
-        models = [
-            {"model_name": model, "litellm_params": {"model": model}}
-            for model in self._tier_map.values()
-        ]
-        self._client = Router(
-            model_list=models,
-            num_retries=1,
-            fallbacks=[],
-        )
-        return self._client
+            self._litellm = _NullLLMClient()
+        else:
+            self._litellm = litellm
+        return self._litellm
 
     def _resolve_model(self, tier: Tier, skill_name: str | None = None) -> str:
-        from flow_speckit.llm.tiers import resolve_tier
-
-        from flow_speckit.llm.tiers import LLMSpec
-
         return resolve_tier(
             LLMSpec(tier=tier),
             self._tier_map,
             skill_name=skill_name,
             overrides=self._overrides,
         )
+
+    def _build_messages(
+        self, prompt: str, context: AssembledContext | None
+    ) -> list[dict[str, Any]]:
+        if context is not None:
+            return [
+                {"role": "system", "content": context.render()},
+                {"role": "user", "content": prompt},
+            ]
+        return [{"role": "user", "content": prompt}]
 
     async def complete(
         self,
@@ -120,52 +129,48 @@ class LLMClient:
         structured/tool-call modes is requested; the result is validated by
         Pydantic with one repair round-trip on failure.
         """
-        client = await self._ensure_client()
-        if isinstance(client, _NullLLMClient):
-            return await client.complete(prompt, tier=tier)
+        litellm = self._ensure_litellm()
+        if isinstance(litellm, _NullLLMClient):
+            return await litellm.complete(prompt, tier=tier)
 
         model = self._resolve_model(tier, skill_name)
-
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        if context is not None:
-            context_str = context.render()
-            messages = [
-                {"role": "system", "content": context_str},
-                {"role": "user", "content": prompt},
-            ]
+        messages = self._build_messages(prompt, context)
 
         kwargs: dict[str, Any] = {"model": model, "messages": messages}
         if response_model is not None:
             kwargs["response_format"] = response_model
 
         for round_num in (1, 2):
+            self._check_budget(skill_name, max_cost_usd)
             try:
-                from litellm import completion  # type: ignore[import-untyped]
-
-                raw = await completion(**kwargs)
+                raw = await litellm.acompletion(**kwargs)
             except Exception as exc:
                 raise SkillOutputError(f"LLM call failed: {exc}") from exc
 
-            self._accumulate_cost(raw)
+            self._record_cost(raw, skill_name)
+
+            message = raw.choices[0].message
+            content = message.content
 
             if response_model is None:
-                content = raw.choices[0].message.content
                 if isinstance(content, str):
                     return content
                 return str(content)
 
             try:
-                if hasattr(raw.choices[0].message, "parsed") and raw.choices[0].message.parsed:
-                    return response_model.model_validate(
-                        raw.choices[0].message.parsed
-                    )
-                content = raw.choices[0].message.content or ""
-                return response_model.model_validate_json(content)
+                parsed = getattr(message, "parsed", None)
+                if parsed:
+                    return response_model.model_validate(parsed)
+                return response_model.model_validate_json(content or "")
             except Exception as exc:
                 if round_num == 2:
                     raise SkillOutputError(
                         f"Structured output validation failed: {exc}"
                     ) from exc
+                # Repair round: show the model its own output plus the error.
+                messages.append(
+                    {"role": "assistant", "content": str(content or "")}
+                )
                 messages.append({
                     "role": "user",
                     "content": f"Previous output did not match the expected schema. "
@@ -184,30 +189,54 @@ class LLMClient:
         tier: Tier = "standard",
         skill_name: str | None = None,
     ) -> Any:
-        """Streaming variant (doc 06 §2); returns an async iterator of chunks."""
-        client = await self._ensure_client()
-        if isinstance(client, _NullLLMClient):
-            return await client.complete_streaming(prompt)
+        """Streaming variant (doc 06 §2); returns an async iterator of chunks.
 
+        Streamed responses are not cost-metered chunk-by-chunk; the run
+        budget is still checked before the call goes out.
+        """
+        litellm = self._ensure_litellm()
+        if isinstance(litellm, _NullLLMClient):
+            return await litellm.complete_streaming(prompt)
+
+        self._check_budget(skill_name, float("inf"))
         model = self._resolve_model(tier, skill_name)
+        messages = self._build_messages(prompt, context)
 
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        if context is not None:
-            context_str = context.render()
-            messages = [
-                {"role": "system", "content": context_str},
-                {"role": "user", "content": prompt},
-            ]
+        return await litellm.acompletion(model=model, messages=messages, stream=True)
 
-        from litellm import completion  # type: ignore[import-untyped]
+    def _check_budget(self, skill_name: str | None, max_cost_usd: float) -> None:
+        """Refuse the next call once a budget is exhausted (doc 06 §4)."""
+        if self._total_cost_usd >= self._default_max_usd_per_run:
+            raise BudgetExceededError(
+                f"Run LLM budget exhausted: spent "
+                f"${self._total_cost_usd:.2f} of the "
+                f"${self._default_max_usd_per_run:.2f} per-run budget"
+            )
+        if skill_name is not None:
+            spent = self._cost_by_skill.get(skill_name, 0.0)
+            if spent >= max_cost_usd:
+                raise BudgetExceededError(
+                    f"Skill {skill_name!r} LLM budget exhausted: spent "
+                    f"${spent:.2f} of its ${max_cost_usd:.2f} budget"
+                )
 
-        return await completion(model=model, messages=messages, stream=True)
-
-    def _accumulate_cost(self, raw: Any) -> None:
-        try:
-            usage = raw.usage
-            if usage is not None:
-                cost = getattr(raw, "_response_cost", 0.0) or 0.0
-                self._total_cost_usd += cost
-        except Exception:
-            pass
+    def _record_cost(self, raw: Any, skill_name: str | None) -> None:
+        """Accumulate the call's USD cost from LiteLLM's response metadata."""
+        cost = 0.0
+        hidden = getattr(raw, "_hidden_params", None)
+        if isinstance(hidden, dict):
+            cost = float(hidden.get("response_cost") or 0.0)
+        if not cost and self._litellm is not None and not isinstance(
+            self._litellm, _NullLLMClient
+        ):
+            try:
+                cost = float(
+                    self._litellm.completion_cost(completion_response=raw) or 0.0
+                )
+            except Exception:
+                cost = 0.0
+        self._total_cost_usd += cost
+        if skill_name is not None:
+            self._cost_by_skill[skill_name] = (
+                self._cost_by_skill.get(skill_name, 0.0) + cost
+            )

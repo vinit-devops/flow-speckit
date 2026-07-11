@@ -7,9 +7,9 @@ Handles branches, worktrees, and diffs locally. PR operations raise
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+from typing import Any
 
-from flow_speckit.git.provider import GitProvider, PullRequestInfo, RepoRef, ReviewInfo
+from flow_speckit.git.provider import PullRequestInfo, RepoRef, ReviewInfo
 
 
 class LocalGitProvider:

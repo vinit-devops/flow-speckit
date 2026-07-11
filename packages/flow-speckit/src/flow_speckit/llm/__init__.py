@@ -6,9 +6,9 @@ and the deterministic artifact-context packer.
 
 from __future__ import annotations
 
-from flow_speckit.llm.tiers import Tier, LLMSpec, resolve_tier
+from flow_speckit.llm.assemble import AssembledContext, ContextAssembler
 from flow_speckit.llm.client import LLMClient
-from flow_speckit.llm.assemble import ContextAssembler, AssembledContext
+from flow_speckit.llm.tiers import LLMSpec, Tier, resolve_tier
 
 __all__ = [
     "AssembledContext",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flow_speckit.skills.base import skill, SkillContext, SkillDefinition
+from flow_speckit.skills.base import SkillContext, SkillDefinition, skill
 from flow_speckit.skills.registry import SkillRegistry, UnknownSkill
 
 __all__ = [

@@ -7,11 +7,18 @@ title+ref.
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+from uuid import UUID
 
 from flow_speckit.artifacts.models import ArtifactModel
-from flow_speckit.artifacts.store import ArtifactStore
+from flow_speckit.artifacts.store import ArtifactNotFound, ArtifactStore
+
+if TYPE_CHECKING:
+    from flow_speckit.artifacts.graph import LineageGraph
+    from flow_speckit.artifacts.refs import ArtifactRef
 
 
 @dataclass
@@ -47,11 +54,21 @@ class AssembledContext:
         return "\n".join(lines)
 
 
+@dataclass
+class _Ancestor:
+    """One lineage ancestor: its stored ref, distance from the primary, and
+    the canonical stored body."""
+
+    ref: ArtifactRef
+    depth: int
+    body: str
+
+
 class ContextAssembler:
     """Deterministic artifact-context packer (doc 06 §5).
 
     Algorithm:
-    1. Walk lineage upward from primaries (latest approved versions only).
+    1. Walk lineage upward from primaries via the store's edge graph.
     2. Order deterministically: depth descending, then created_at.
     3. Budget by token count; degrade ancestors gracefully.
     4. Every included artifact carries its ref so skills can cite provenance.
@@ -70,22 +87,33 @@ class ContextAssembler:
     async def assemble(
         self,
         *primary: ArtifactModel,
+        primary_refs: Sequence[str] | None = None,
         budget_tokens: int = 24_000,
         include: Literal["lineage", "primary-only"] = "lineage",
     ) -> AssembledContext:
-        """Assemble context from *primary* artifacts and optionally their lineage."""
+        """Assemble context from *primary* artifacts and optionally their lineage.
+
+        ``primary_refs`` are the store addresses (``"key@N"`` or bare key) of
+        the primaries, aligned by position. Models carry no identity of their
+        own, so lineage can only be walked for primaries whose ref is given;
+        without refs the result degrades to primary-only content.
+        """
         result = AssembledContext()
+        refs = list(primary_refs or [])
 
         # 1. Primary artifacts always at full fidelity
         primary_chunks: list[ContextChunk] = []
-        for model in primary:
-            ref_key = f"{model.artifact_type}/{_title_slug(model)}"
-            body = model.render_md()
+        for i, model in enumerate(primary):
+            ref_key = (
+                refs[i]
+                if i < len(refs)
+                else f"{model.artifact_type}/{_title_slug(model)}"
+            )
             primary_chunks.append(
                 ContextChunk(
                     ref_address=ref_key,
                     fidelity="full",
-                    content=body,
+                    content=model.render_md(),
                 )
             )
             result.primary_refs.append(ref_key)
@@ -95,40 +123,17 @@ class ContextAssembler:
         remaining = budget_tokens - result.total_tokens
 
         # 2. Walk lineage upward and add ancestors with degrading fidelity
-        if include == "lineage" and remaining > 0 and self._store is not None:
-            ancestors = await self._walk_lineage(primary, max_depth=self._MAX_DEPTH)
-            # Order deterministically: depth descending, then type, then title
-            ancestors.sort(key=lambda a: (-a.depth, a.artifact_type, a.title or ""))
+        if include == "lineage" and remaining > 0 and self._store is not None and refs:
+            ancestors = await self._collect_ancestors(
+                refs, max_depth=self._MAX_DEPTH
+            )
+            # Deterministic order: farthest ancestors first, then created_at
+            ancestors.sort(key=lambda a: (-a.depth, a.ref.created_at))
 
             for ancestor in ancestors:
                 if remaining <= 0:
                     break
-                body = ancestor.render_md()
-                # Try full first, then summary, then title-only
-                tokens_full = self._estimate_chars(len(body))
-                if tokens_full <= remaining:
-                    chunk = ContextChunk(
-                        ref_address=ancestor.ref_address,
-                        fidelity="full",
-                        content=body,
-                    )
-                else:
-                    summary = body[: self._SUMMARY_MAX_CHARS]
-                    tokens_sum = self._estimate_chars(len(summary))
-                    if tokens_sum <= remaining:
-                        chunk = ContextChunk(
-                            ref_address=ancestor.ref_address,
-                            fidelity="summary",
-                            content=summary + f"\n... (truncated)",
-                        )
-                    else:
-                        title = ancestor.title or ancestor.artifact_type
-                        chunk = ContextChunk(
-                            ref_address=ancestor.ref_address,
-                            fidelity="title",
-                            content=f"#{title} (ref: {ancestor.ref_address})",
-                        )
-
+                chunk = self._degrade(ancestor, remaining)
                 chunk_tokens = self._estimate_chars(len(chunk.content))
                 result.chunks.append(chunk)
                 result.total_tokens += chunk_tokens
@@ -136,41 +141,55 @@ class ContextAssembler:
 
         return result
 
-    async def _walk_lineage(
-        self, primaries: tuple[ArtifactModel, ...], max_depth: int
-    ) -> list[_Ancestor]:
-        """Walk lineage upward via ``derived_from`` edges. Returns deduplicated
-        ancestors with depth metadata."""
-        seen: set[str] = set()
-        ancestors: list[_Ancestor] = []
+    def _degrade(self, ancestor: _Ancestor, remaining: int) -> ContextChunk:
+        """Pick the highest fidelity that fits: full → summary → title."""
+        body = ancestor.body
+        address = ancestor.ref.address
+        if self._estimate_chars(len(body)) <= remaining:
+            return ContextChunk(
+                ref_address=address, fidelity="full", content=body
+            )
+        summary = body[: self._SUMMARY_MAX_CHARS]
+        if self._estimate_chars(len(summary)) <= remaining:
+            return ContextChunk(
+                ref_address=address,
+                fidelity="summary",
+                content=summary + "\n... (truncated)",
+            )
+        return ContextChunk(
+            ref_address=address,
+            fidelity="title",
+            content=f"# {ancestor.ref.key} (ref: {address})",
+        )
 
-        async def walk(model: ArtifactModel, depth: int) -> None:
-            if depth > max_depth:
-                return
-            # In the real implementation this calls self._store.lineage().
-            # For now we accept a flat primary set — the store is always
-            # available but the input artifact model may not have a stored ref
-            # yet (it's being created by a skill). The SkillContext will
-            # pass the refs that were in the step payload when it wires
-            # this assembler. So we do our best with what we have.
-            key = f"{model.artifact_type}:{_title_slug(model)}"
-            if key in seen:
-                return
-            seen.add(key)
-            if depth > 0:  # depth 0 = primaries, already added
+    async def _collect_ancestors(
+        self, refs: Sequence[str], *, max_depth: int
+    ) -> list[_Ancestor]:
+        """Walk the store's lineage graph upward from every primary ref,
+        deduplicating shared ancestors across primaries."""
+        seen: set[UUID] = set()
+        ancestors: list[_Ancestor] = []
+        for ref in refs:
+            try:
+                graph = await self._store.lineage(
+                    ref, direction="up", max_depth=max_depth
+                )
+            except ArtifactNotFound:
+                # A primary mid-creation has no stored row (and thus no
+                # lineage) yet — skip it rather than fail assembly.
+                continue
+            depths = _depths_from_root(graph)
+            seen.add(graph.root)
+            for node in graph.nodes:
+                if node.id in seen:
+                    continue
+                seen.add(node.id)
+                body = await self._store.get_body_md(node.id) or ""
                 ancestors.append(
                     _Ancestor(
-                        artifact_type=model.artifact_type,
-                        title=getattr(model, "title", None),
-                        ref_address=f"{model.artifact_type}/{_title_slug(model)}",
-                        model=model,
-                        depth=depth,
+                        ref=node, depth=depths.get(node.id, 1), body=body
                     )
                 )
-
-        for primary in primaries:
-            await walk(primary, depth=0)
-
         return ancestors
 
     def _estimate_tokens(self, chunks: list[ContextChunk]) -> int:
@@ -190,13 +209,18 @@ def _title_slug(model: ArtifactModel) -> str:
     return "unnamed"
 
 
-@dataclass
-class _Ancestor:
-    artifact_type: str
-    title: str | None
-    ref_address: str
-    model: ArtifactModel
-    depth: int
-
-    def render_md(self) -> str:
-        return self.model.render_md()
+def _depths_from_root(graph: LineageGraph) -> dict[UUID, int]:
+    """BFS distance of every lineage node from the graph root."""
+    adjacency: dict[UUID, list[UUID]] = {}
+    for edge in graph.edges:
+        adjacency.setdefault(edge.from_id, []).append(edge.to_id)
+        adjacency.setdefault(edge.to_id, []).append(edge.from_id)
+    depths = {graph.root: 0}
+    queue: deque[UUID] = deque([graph.root])
+    while queue:
+        current = queue.popleft()
+        for neighbor in adjacency.get(current, ()):
+            if neighbor not in depths:
+                depths[neighbor] = depths[current] + 1
+                queue.append(neighbor)
+    return depths

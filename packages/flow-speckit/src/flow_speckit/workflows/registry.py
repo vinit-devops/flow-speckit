@@ -8,6 +8,7 @@ from pathlib import Path
 
 import structlog
 
+from flow_speckit.shared import resolve_collision
 from flow_speckit.workflows.dsl import WorkflowDefinition
 
 logger = structlog.get_logger(__name__)
@@ -47,7 +48,10 @@ class WorkflowRegistry:
         if existing.fn is definition.fn:
             return  # re-registering the identical workflow is a no-op
 
-        if definition.source_package == _LOCAL:
+        decision = resolve_collision(
+            definition.source_package, existing.source_package
+        )
+        if decision == "replace":
             # A local registration always overrides whatever was there before.
             logger.warning(
                 "workflow_local_override",
@@ -59,7 +63,7 @@ class WorkflowRegistry:
             self._workflows[key] = definition
             return
 
-        if existing.source_package == _LOCAL:
+        if decision == "keep_existing":
             # An installed package must never silently clobber a local override.
             logger.warning(
                 "workflow_local_override_kept",

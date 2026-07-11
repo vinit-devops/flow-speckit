@@ -13,7 +13,6 @@ path or reach outside this surface.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 

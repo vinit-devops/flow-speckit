@@ -60,17 +60,19 @@ def doctor() -> None:
             settings = FlowSpeckitSettings.load(root=root)
         except Exception as exc:
             typer.echo(f"✗ Config: {exc}")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
+
+        config_path = root / "flow-speckit.toml"
+        if config_path.exists():
+            typer.echo(f"✓ Config: {config_path}")
+        else:
+            typer.echo("✓ Config: defaults (no flow-speckit.toml)")
 
         try:
             db_url = resolve_database_url(settings, root)
-            typer.echo(f"✓ Config: {root / 'flow-speckit.toml'}")
-        except Exception:
-            db_url = settings.database_url
-            if not db_url:
-                typer.echo("✗ No database URL configured")
-                raise typer.Exit(1)
-            typer.echo("✓ Config (database from env)")
+        except Exception as exc:
+            typer.echo(f"✗ No database URL configured: {exc}")
+            raise typer.Exit(1) from None
 
         # Database
         try:
@@ -85,7 +87,7 @@ def doctor() -> None:
             typer.echo("✓ Database reachable")
         except Exception as exc:
             typer.echo(f"✗ Database unreachable: {exc}")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
 
         # Backends
         from flow_speckit.execution.backend_registry import BackendRegistry

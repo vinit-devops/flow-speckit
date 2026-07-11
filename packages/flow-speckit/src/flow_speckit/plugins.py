@@ -83,22 +83,16 @@ _ENTRY_POINT_GROUPS = {
 def discover_entry_points(group: str) -> Iterator[tuple[str, Any]]:
     """Yield ``(name, loaded_object)`` for every entry point in *group*.
 
-    Wraps ``ep.load()`` failures with the entry-point name so callers get
-    actionable diagnostics (phase3-followups item).
+    ``ep.load()`` failures are logged with the entry-point name and skipped,
+    so one broken plugin cannot take down discovery for every command.
     """
     if group not in _ENTRY_POINT_GROUPS:
         return
-    if sys.version_info >= (3, 12):
-        from importlib.metadata import entry_points
+    from importlib.metadata import entry_points
 
-        eps = entry_points(group=group)
-    else:
-        from importlib.metadata import entry_points  # type: ignore[no-redef]
-
-        eps = entry_points().get(group, ())
-    for ep in eps:
+    for ep in entry_points(group=group):
         try:
-            yield ep.name, ep.load()
+            loaded = ep.load()
         except Exception:
             logger.warning(
                 "entry_point_load_failed",
@@ -106,10 +100,8 @@ def discover_entry_points(group: str) -> Iterator[tuple[str, Any]]:
                 entry_point=ep.name,
                 exc_info=True,
             )
-            # Re-raise with the entry-point name for actionable errors
-            raise RuntimeError(
-                f"Failed to load entry point {ep.name!r} from group {group!r}"
-            )
+            continue
+        yield ep.name, loaded
 
 
 # ---------------------------------------------------------------------------

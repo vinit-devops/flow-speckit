@@ -8,6 +8,7 @@ files.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import ClassVar
 
@@ -68,49 +69,30 @@ class WorkspaceManager:
         3. Generate unified diff `base...target`.
         """
         wt = workspace.path
-        # Check for uncommitted changes
-        status_proc = await asyncio.create_subprocess_exec(
-            self._GIT,
-            "-C",
-            str(wt),
-            "status",
-            "--porcelain",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        status_out, _ = await status_proc.communicate()
+        # Commit any uncommitted changes as a checkpoint
+        _, status_out, _ = await self._run_git(wt, "status", "--porcelain")
         if status_out.strip():
             await self._run_git(wt, "add", "-A")
             await self._run_git(wt, "commit", "-m", "flow-speckit: checkpoint")
 
-        # Collect commits
-        proc = await asyncio.create_subprocess_exec(
-            self._GIT,
-            "-C",
-            str(wt),
-            "log",
-            "--format=%H",
-            f"{workspace.base_branch}..{workspace.target_branch}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Commit list and merge-base diff are independent reads of the same
+        # finalized branch state — run the two git processes concurrently.
+        # Three-dot diff so commits added to base after divergence never show
+        # up as spurious removals.
+        (_, log_out, _), (_, diff_text, _) = await asyncio.gather(
+            self._run_git(
+                wt,
+                "log",
+                "--format=%H",
+                f"{workspace.base_branch}..{workspace.target_branch}",
+            ),
+            self._run_git(
+                wt,
+                "diff",
+                f"{workspace.base_branch}...{workspace.target_branch}",
+            ),
         )
-        log_out, _ = await proc.communicate()
-        commits = [sha for sha in log_out.decode().strip().split("\n") if sha]
-
-        # Unified diff
-        diff_proc = await asyncio.create_subprocess_exec(
-            self._GIT,
-            "-C",
-            str(wt),
-            "diff",
-            workspace.base_branch,
-            workspace.target_branch,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        diff_out, _ = await diff_proc.communicate()
-        diff_text = diff_out.decode()
-
+        commits = [sha for sha in log_out.strip().split("\n") if sha]
         return commits, diff_text
 
     async def cleanup(
@@ -121,23 +103,30 @@ class WorkspaceManager:
         ``git worktree remove --force`` deletes the directory itself, so no
         separate ``rmtree`` or pre-emptive ``prune`` is needed. ``prune`` on
         the main repo afterward is safety-only for stale metadata.
+
+        ``keep_on_failure=True`` (default) preserves the run branch for
+        inspection; ``False`` deletes it too.
         """
-        try:
+        repo = Path(workspace.repo)
+        # Suppressed failures below mean the worktree/branch is already gone.
+        with contextlib.suppress(Exception):
             await self._run_git(
-                Path(workspace.repo),
+                repo,
                 "worktree",
                 "remove",
                 str(workspace.path),
                 "--force",
             )
-        except Exception:
-            pass  # worktree already gone
 
         # Prune stale metadata (defensive)
-        try:
-            await self._run_git(Path(workspace.repo), "worktree", "prune")
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            await self._run_git(repo, "worktree", "prune")
+
+        if not keep_on_failure:
+            with contextlib.suppress(Exception):
+                await self._run_git(
+                    repo, "branch", "-D", workspace.target_branch
+                )
 
     @staticmethod
     async def _run_git(cwd: Path, *args: str) -> tuple[int, str, str]:

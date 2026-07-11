@@ -11,7 +11,6 @@ import asyncio
 from flow_speckit.execution.base import (
     BackendHealth,
     CostReport,
-    ExecutionBackend,
     ExecutionEventSink,
     ExecutionResult,
     ExecutionTask,
@@ -84,7 +83,11 @@ class LocalShellBackend:
                 logs_ref="",  # blob-stored at caller level
                 cost=CostReport(estimated=True),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
+            # wait_for cancelled communicate() but the process is still
+            # running — reap it so a timed-out task can't leak a subprocess.
+            proc.kill()
+            await proc.wait()
             return ExecutionResult(
                 status="failed",
                 summary=f"Command timed out after {task.constraints.timeout_s}s",

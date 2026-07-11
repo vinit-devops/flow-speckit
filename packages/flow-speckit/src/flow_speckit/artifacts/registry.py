@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from flow_speckit.artifacts.models import ArtifactModel
+from flow_speckit.shared import resolve_collision
 from flow_speckit.storage.schema import artifact_types
 
 logger = structlog.get_logger(__name__)
@@ -43,7 +44,8 @@ class ArtifactRegistry:
         if existing.cls is cls:
             return  # re-registering the identical class is a no-op
 
-        if source_package == _LOCAL:
+        decision = resolve_collision(source_package, existing.source_package)
+        if decision == "replace":
             # A local registration always overrides whatever was there before.
             logger.warning(
                 "artifact_type_local_override",
@@ -54,7 +56,7 @@ class ArtifactRegistry:
             self._types[name] = RegisteredType(cls=cls, source_package=source_package)
             return
 
-        if existing.source_package == _LOCAL:
+        if decision == "keep_existing":
             # An installed package must never silently clobber a local override.
             logger.warning(
                 "artifact_type_local_override_kept",

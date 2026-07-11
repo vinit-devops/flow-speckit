@@ -19,6 +19,16 @@ from flow_speckit.plugins import discover_entry_points
 logger = structlog.get_logger(__name__)
 
 
+def _is_backend(obj: Any) -> bool:
+    """Duck-typed ExecutionBackend check (the Protocol is not runtime_checkable)."""
+    return (
+        hasattr(obj, "name")
+        and hasattr(obj, "check_available")
+        and hasattr(obj, "execute")
+        and not isinstance(obj, type)
+    )
+
+
 class BackendRegistry:
     """In-memory registry of available execution backends."""
 
@@ -31,21 +41,27 @@ class BackendRegistry:
         local = LocalShellBackend()
         self._backends[local.name] = local
 
-        # Entry-point backends
+        # Entry-point backends. ExecutionBackend is a non-runtime_checkable
+        # Protocol, so conformance is duck-typed rather than isinstance-checked.
         for name, obj in discover_entry_points("flow_speckit.backends"):
-            backend: ExecutionBackend
-            if isinstance(obj, ExecutionBackend):
-                backend = obj
-            elif callable(obj):
-                backend = obj()
-            else:
+            try:
+                backend = obj() if not _is_backend(obj) and callable(obj) else obj
+            except Exception:
                 logger.warning(
                     "backend_entry_point_skipped",
                     name=name,
-                    reason=f"expected ExecutionBackend, got {type(obj).__name__}",
+                    reason="factory raised during instantiation",
+                    exc_info=True,
                 )
                 continue
-            self._backends[name] = backend
+            if not _is_backend(backend):
+                logger.warning(
+                    "backend_entry_point_skipped",
+                    name=name,
+                    reason=f"expected ExecutionBackend, got {type(backend).__name__}",
+                )
+                continue
+            self._backends[backend.name] = backend
 
     def get(self, name: str) -> ExecutionBackend:
         """Resolve a backend by name. Raises ``KeyError`` if not found."""

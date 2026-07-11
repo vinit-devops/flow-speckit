@@ -7,6 +7,7 @@ Does NOT require a database — uses in-memory fakes and mock objects.
 from __future__ import annotations
 
 import json
+from datetime import UTC
 
 import pytest
 
@@ -22,8 +23,8 @@ from flow_speckit.execution.base import (
 from flow_speckit.execution.local_shell import LocalShellBackend
 from flow_speckit.git.local import LocalGitProvider
 from flow_speckit.git.provider import RepoRef
-from flow_speckit.llm.tiers import LLMSpec, resolve_tier
 from flow_speckit.llm.assemble import AssembledContext, ContextAssembler, ContextChunk
+from flow_speckit.llm.tiers import LLMSpec, resolve_tier
 from flow_speckit.skills.base import SkillContext, skill
 from flow_speckit.skills.registry import SkillRegistry, UnknownSkill
 from flow_speckit.skills.testing import RecordedLLM, SkillHarness
@@ -50,8 +51,10 @@ class TestLLMSpec:
         assert spec.max_cost_usd == 10.0
 
     def test_immutable(self):
+        from pydantic import ValidationError
+
         spec = LLMSpec(tier="fast")
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             spec.tier = "standard"  # type: ignore[misc]
 
 
@@ -425,3 +428,210 @@ class TestPlugins:
 
         skills = list(discover_local_skills(tmp_path))
         assert skills == []
+
+
+# ==========================================================================
+# 11. LLM cost accounting and budget enforcement (doc 06 §4)
+# ==========================================================================
+
+
+class _FakeRaw:
+    """Mimics a LiteLLM ModelResponse's cost metadata."""
+
+    def __init__(self, cost: float) -> None:
+        self._hidden_params = {"response_cost": cost}
+
+
+class TestLLMBudget:
+    def test_record_cost_reads_hidden_params(self):
+        from flow_speckit.llm.client import LLMClient
+
+        client = LLMClient({"standard": "m"})
+        client._record_cost(_FakeRaw(1.25), "my_skill")
+        assert client.total_cost_usd == 1.25
+        assert client.cost_for_skill("my_skill") == 1.25
+
+    def test_run_budget_enforced(self):
+        from flow_speckit.llm.client import BudgetExceededError, LLMClient
+
+        client = LLMClient({"standard": "m"}, default_max_usd_per_run=2.0)
+        client._record_cost(_FakeRaw(2.5), "s")
+        with pytest.raises(BudgetExceededError, match="Run LLM budget"):
+            client._check_budget("s", 100.0)
+
+    def test_skill_budget_enforced(self):
+        from flow_speckit.llm.client import BudgetExceededError, LLMClient
+
+        client = LLMClient({"standard": "m"}, default_max_usd_per_run=100.0)
+        client._record_cost(_FakeRaw(6.0), "spender")
+        with pytest.raises(BudgetExceededError, match="'spender'"):
+            client._check_budget("spender", 5.0)
+        # Other skills are unaffected by one skill's exhaustion
+        client._check_budget("other", 5.0)
+
+
+# ==========================================================================
+# 12. Backend registry
+# ==========================================================================
+
+
+class TestBackendRegistry:
+    def test_get_local_shell(self):
+        from flow_speckit.execution.backend_registry import BackendRegistry
+
+        registry = BackendRegistry()
+        backend = registry.get("local_shell")
+        assert backend.name == "local_shell"
+
+    def test_unknown_backend_raises(self):
+        from flow_speckit.execution.backend_registry import BackendRegistry
+
+        registry = BackendRegistry()
+        with pytest.raises(KeyError, match="No backend named"):
+            registry.get("nonexistent")
+
+
+# ==========================================================================
+# 13. Execution conformance suite against local_shell
+# ==========================================================================
+
+
+class TestConformanceSuite:
+    async def test_local_shell_passes(self, tmp_path):
+        from flow_speckit.execution.testing import run_conformance_suite
+
+        backend = LocalShellBackend()
+        ws = Workspace(
+            path=tmp_path, repo=".", base_branch="main", target_branch="t"
+        )
+        await run_conformance_suite(backend, ws)
+
+
+# ==========================================================================
+# 14. WorkspaceManager worktree lifecycle (real git)
+# ==========================================================================
+
+
+class TestWorkspaceManager:
+    async def test_worktree_lifecycle(self, tmp_path):
+        import subprocess
+
+        from flow_speckit.execution.workspace import WorkspaceManager
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        git("init", "-b", "main")
+        git("config", "user.email", "test@test")
+        git("config", "user.name", "test")
+        (repo / "a.txt").write_text("one\n")
+        git("add", "-A")
+        git("commit", "-m", "init")
+
+        manager = WorkspaceManager()
+        ws = await manager.prepare(repo, "main", "run1")
+        assert ws.path.exists()
+        # prepare must not switch the main working tree off its branch
+        assert git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+        (ws.path / "b.txt").write_text("two\n")
+        commits, diff = await manager.capture(ws)
+        assert len(commits) == 1
+        assert "b.txt" in diff
+
+        await manager.cleanup(ws, keep_on_failure=False)
+        assert not ws.path.exists()
+        assert git("branch", "--list", "flow-speckit/run-run1") == ""
+
+
+# ==========================================================================
+# 15. ContextAssembler lineage walking (doc 06 §5)
+# ==========================================================================
+
+
+class _FakeLineageStore:
+    """Stands in for ArtifactStore: one primary with one stored ancestor."""
+
+    def __init__(self, graph, bodies):
+        self._graph = graph
+        self._bodies = bodies
+
+    async def lineage(self, ref, *, direction="up", max_depth=32):
+        return self._graph
+
+    async def get_body_md(self, ref):
+        return self._bodies.get(ref)
+
+
+class TestContextAssemblerLineage:
+    def _make_store(self):
+        from datetime import datetime
+        from uuid import uuid4
+
+        from flow_speckit.artifacts.graph import LineageEdge, LineageGraph
+        from flow_speckit.artifacts.refs import ArtifactRef
+
+        root_id, parent_id = uuid4(), uuid4()
+
+        def ref(rid, key):
+            return ArtifactRef(
+                id=rid,
+                type="generic",
+                key=key,
+                version=1,
+                status="approved",
+                content_hash="x",
+                created_at=datetime.now(UTC),
+            )
+
+        graph = LineageGraph(
+            root=root_id,
+            nodes=[ref(root_id, "child"), ref(parent_id, "parent")],
+            edges=[
+                LineageEdge(
+                    from_id=root_id, to_id=parent_id, relation="derived_from"
+                )
+            ],
+        )
+        return _FakeLineageStore(
+            graph, {parent_id: "# Parent body\n" + "x" * 4000}
+        )
+
+    async def test_lineage_ancestors_included(self):
+        store = self._make_store()
+        assembler = ContextAssembler(store)  # type: ignore[arg-type]
+        artifact = GenericArtifact(title="Child", body="child body")
+        result = await assembler.assemble(
+            artifact, primary_refs=["child@1"], include="lineage"
+        )
+        addresses = [c.ref_address for c in result.chunks]
+        assert addresses[0] == "child@1"
+        assert "parent@1" in addresses
+        parent_chunk = next(c for c in result.chunks if c.ref_address == "parent@1")
+        assert parent_chunk.fidelity == "full"
+        assert "Parent body" in parent_chunk.content
+
+    async def test_tiny_budget_degrades_to_title(self):
+        store = self._make_store()
+        assembler = ContextAssembler(store)  # type: ignore[arg-type]
+        artifact = GenericArtifact(title="Child", body="child body")
+        result = await assembler.assemble(
+            artifact, primary_refs=["child@1"], budget_tokens=8
+        )
+        parent_chunk = next(c for c in result.chunks if c.ref_address == "parent@1")
+        assert parent_chunk.fidelity == "title"
+
+    async def test_no_refs_falls_back_to_primary_only(self):
+        store = self._make_store()
+        assembler = ContextAssembler(store)  # type: ignore[arg-type]
+        artifact = GenericArtifact(title="Child", body="child body")
+        result = await assembler.assemble(artifact)
+        assert len(result.chunks) == 1

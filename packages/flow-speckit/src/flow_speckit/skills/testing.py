@@ -16,8 +16,7 @@ from pydantic import BaseModel
 
 from flow_speckit.artifacts.models import ArtifactModel
 from flow_speckit.artifacts.registry import ArtifactRegistry
-from flow_speckit.artifacts.store import ArtifactStore
-from flow_speckit.skills.base import SkillContext, SkillDefinition
+from flow_speckit.skills.base import SkillContext
 from flow_speckit.skills.registry import SkillRegistry
 
 

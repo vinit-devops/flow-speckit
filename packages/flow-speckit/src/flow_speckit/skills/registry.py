@@ -4,8 +4,8 @@ Two sources feed the registry:
 1. Entry points — installed packages declare ``[project.entry-points."flow_speckit.skills"]``.
 2. Project-local — ``./skills/*.py`` in the target repo auto-loads at startup.
 
-Uses ``flow_speckit.shared.local_override`` for collision policy (shared with
-WorkflowRegistry and ArtifactRegistry).
+Uses ``flow_speckit.shared.resolve_collision`` for collision policy (shared
+with WorkflowRegistry and ArtifactRegistry).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any
 
 import structlog
 
-from flow_speckit.shared import RegistryCollision, local_override
+from flow_speckit.shared import RegistryCollision, resolve_collision
 from flow_speckit.skills.base import SkillDefinition
 
 logger = structlog.get_logger(__name__)
@@ -43,53 +43,35 @@ class SkillRegistry:
                 f"{skill_fn!r} is not a @skill-decorated function. "
                 "Use the @skill decorator before registering."
             )
-        definition = SkillDefinition(
-            name=raw.name,
-            version=raw.version,
-            fn=raw.fn,
-            input_types=raw.input_types,
-            output_type=raw.output_type,
-            llm=raw.llm,
-            provenance=provenance,
-        )
+        definition = raw.model_copy(update={"provenance": provenance})
         entries = self._by_name.setdefault(raw.name, [])
         for existing in entries:
-            if existing.version == definition.version:
-                key = f"{raw.name}@{definition.version}"
-                decision = local_override(
-                    existing,
-                    definition,
-                    key=key,
-                    provenance=provenance,
-                    existing_provenance=existing.provenance,
+            if existing.version != definition.version:
+                continue
+            decision = resolve_collision(provenance, existing.provenance)
+            if decision == "keep_existing":
+                logger.warning(
+                    "skill_override_ignored",
+                    skill_name=raw.name,
+                    version=definition.version,
+                    attempted_from=provenance,
+                    kept_from=existing.provenance,
                 )
-                if decision is existing:
-                    logger.warning(
-                        "skill_override_ignored",
-                        skill_name=raw.name,
-                        version=definition.version,
-                        attempted_from=provenance,
-                        kept_from=existing.provenance,
-                    )
-                    return existing
-                if decision is None:
-                    if provenance == "local" or provenance.startswith("local"):
-                        logger.warning(
-                            "skill_local_override",
-                            skill_name=raw.name,
-                            version=definition.version,
-                            replaced_from=existing.provenance,
-                        )
-                        entries.remove(existing)
-                        break
-                    # non-local over non-local → RegistryCollision raised
-                    raise RegistryCollision(
-                        f"Skill name collision: {raw.name!r} version "
-                        f"{definition.version!r} from {provenance!r} conflicts "
-                        f"with version {existing.version!r} from "
-                        f"{existing.provenance!r}"
-                    )
-                # decision is definition (unreachable for registries)
+                return existing
+            if decision == "replace":
+                logger.warning(
+                    "skill_local_override",
+                    skill_name=raw.name,
+                    version=definition.version,
+                    replaced_from=existing.provenance,
+                )
+                entries.remove(existing)
+                break
+            raise RegistryCollision(
+                f"Skill {raw.name!r} version {definition.version!r} is "
+                f"already registered from {existing.provenance!r}; cannot "
+                f"re-register from {provenance!r}"
+            )
         entries.append(definition)
         return definition
 
