@@ -1,3 +1,9 @@
+"""``flow-speckit`` CLI entrypoint and doctor command (doc 07 §1)."""
+
+import asyncio
+import platform
+from pathlib import Path
+
 import typer
 
 import flow_speckit
@@ -10,6 +16,7 @@ from flow_speckit.cli import (
     runs_cmd,
     skills_cmd,
 )
+from flow_speckit.config import FlowSpeckitSettings, resolve_database_url
 
 app = typer.Typer(name="flow-speckit", no_args_is_help=True, add_completion=False)
 app.command("init")(init_cmd.init)
@@ -30,7 +37,9 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def root(
-    version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True),
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True
+    ),
 ) -> None:
     """Durable, artifact-driven AI-SDLC workflow orchestration."""
 
@@ -38,48 +47,67 @@ def root(
 @app.command("doctor")
 def doctor() -> None:
     """Check database reachable, backends available (doc 07 §1)."""
-    from flow_speckit.cli.init_cmd import (
-        get_config_path,
-        load_settings,
-        setup_database,
-    )
 
-    config_path = get_config_path()
-    console = typer.colors
-    try:
-        settings = load_settings()
-    except Exception as exc:
-        typer.echo(f"✗ Config error: {exc}")
-        raise typer.Exit(1)
+    async def _run() -> None:
+        root = Path.cwd()
+        typer.echo(f"flow-speckit {flow_speckit.__version__}")
+        typer.echo(f"Python    {platform.python_version()}")
+        typer.echo(f"Repo root {root}")
+        typer.echo("")
 
-    typer.echo(f"✓ Config: {config_path}")
+        # Config
+        try:
+            settings = FlowSpeckitSettings.load(root=root)
+        except Exception as exc:
+            typer.echo(f"✗ Config: {exc}")
+            raise typer.Exit(1)
 
-    # Database check
-    from flow_speckit.storage.db import create_engine, session_factory
+        try:
+            db_url = resolve_database_url(settings, root)
+            typer.echo(f"✓ Config: {root / 'flow-speckit.toml'}")
+        except Exception:
+            db_url = settings.database_url
+            if not db_url:
+                typer.echo("✗ No database URL configured")
+                raise typer.Exit(1)
+            typer.echo("✓ Config (database from env)")
 
-    try:
-        engine = create_engine(settings.database_url)
-        typer.echo(f"✓ Database: {settings.database_url}")
-    except Exception as exc:
-        typer.echo(f"✗ Database unreachable: {exc}")
-        raise typer.Exit(1)
+        # Database
+        try:
+            from sqlalchemy import text
 
-    # Backend check
-    from flow_speckit.execution.local_shell import LocalShellBackend
+            from flow_speckit.storage.db import create_engine
 
-    try:
-        import asyncio
+            engine = create_engine(db_url)
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            await engine.dispose()
+            typer.echo("✓ Database reachable")
+        except Exception as exc:
+            typer.echo(f"✗ Database unreachable: {exc}")
+            raise typer.Exit(1)
 
-        backend = LocalShellBackend()
-        health = asyncio.get_event_loop().run_until_complete(backend.check_available())
-        if health.available:
-            typer.echo(f"✓ Backend available: {backend.name} ({health.version})")
-        else:
-            typer.echo(f"✗ Backend not available: {backend.name} — {health.message}")
-    except Exception as exc:
-        typer.echo(f"✗ Backend check failed: {exc}")
+        # Backends
+        from flow_speckit.execution.backend_registry import BackendRegistry
 
-    typer.echo("\nRun `flow-speckit doctor` anytime to re-check.")
+        registry = BackendRegistry()
+        registry.discover()
+        for backend in registry.list_all():
+            try:
+                health = await backend.check_available()
+                if health.available:
+                    typer.echo(
+                        f"✓ Backend: {backend.name} ({health.version or 'unknown'})"
+                    )
+                else:
+                    typer.echo(f"✗ Backend: {backend.name} — {health.message}")
+            except Exception as exc:
+                typer.echo(f"✗ Backend: {backend.name} — check failed: {exc}")
+
+        typer.echo("")
+        typer.echo("Run `flow-speckit doctor` anytime to re-check.")
+
+    asyncio.run(_run())
 
 
 def main() -> None:

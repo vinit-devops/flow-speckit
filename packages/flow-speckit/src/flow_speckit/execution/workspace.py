@@ -8,12 +8,10 @@ files.
 from __future__ import annotations
 
 import asyncio
-import shutil
 from pathlib import Path
 from typing import ClassVar
 
 from flow_speckit.execution.base import Workspace
-
 
 _RUN_WORKTREES = ".flow-speckit/wt"
 
@@ -37,18 +35,22 @@ class WorkspaceManager:
 
         Branch name: ``flow-speckit/run-<run_id>``.
         Worktree path: ``<repo_root>/.flow-speckit/wt/<run_id>``.
+
+        Uses ``git worktree add -b <branch> <path> <base>`` in a single
+        command — never touches the main working tree.
         """
         branch = f"flow-speckit/run-{run_id}"
         wt_path = repo_root / _RUN_WORKTREES / run_id
         wt_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create branch from base
         await self._run_git(
-            repo_root, "checkout", "-b", branch, base_branch
-        )
-        # Add worktree
-        await self._run_git(
-            repo_root, "worktree", "add", str(wt_path), branch
+            repo_root,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(wt_path),
+            base_branch,
         )
 
         return Workspace(
@@ -68,32 +70,39 @@ class WorkspaceManager:
         wt = workspace.path
         # Check for uncommitted changes
         status_proc = await asyncio.create_subprocess_exec(
-            self._GIT, "-C", str(wt), "status", "--porcelain",
+            self._GIT,
+            "-C",
+            str(wt),
+            "status",
+            "--porcelain",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         status_out, _ = await status_proc.communicate()
         if status_out.strip():
             await self._run_git(wt, "add", "-A")
-            await self._run_git(
-                wt, "commit", "-m", "flow-speckit: checkpoint"
-            )
+            await self._run_git(wt, "commit", "-m", "flow-speckit: checkpoint")
 
         # Collect commits
         proc = await asyncio.create_subprocess_exec(
-            self._GIT, "-C", str(wt), "log", "--format=%H",
+            self._GIT,
+            "-C",
+            str(wt),
+            "log",
+            "--format=%H",
             f"{workspace.base_branch}..{workspace.target_branch}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         log_out, _ = await proc.communicate()
-        commits = [
-            sha for sha in log_out.decode().strip().split("\n") if sha
-        ]
+        commits = [sha for sha in log_out.decode().strip().split("\n") if sha]
 
         # Unified diff
         diff_proc = await asyncio.create_subprocess_exec(
-            self._GIT, "-C", str(wt), "diff",
+            self._GIT,
+            "-C",
+            str(wt),
+            "diff",
             workspace.base_branch,
             workspace.target_branch,
             stdout=asyncio.subprocess.PIPE,
@@ -104,36 +113,37 @@ class WorkspaceManager:
 
         return commits, diff_text
 
-    async def cleanup(self, workspace: Workspace, *, keep_on_failure: bool = True) -> None:
+    async def cleanup(
+        self, workspace: Workspace, *, keep_on_failure: bool = True
+    ) -> None:
         """Remove the worktree and optionally the branch.
 
-        ``keep_on_failure``: always cleanup the worktree directory but
-        preserve the branch for inspection when ``True`` (default).
+        ``git worktree remove --force`` deletes the directory itself, so no
+        separate ``rmtree`` or pre-emptive ``prune`` is needed. ``prune`` on
+        the main repo afterward is safety-only for stale metadata.
         """
-        # Prune the worktree metadata
-        await self._run_git(
-            workspace.path.parent,
-            "worktree", "prune",
-        )
-
-        # Remove the worktree directory
-        if workspace.path.exists():
-            await asyncio.to_thread(shutil.rmtree, str(workspace.path))
-
-        # Remove the worktree from git's list
         try:
             await self._run_git(
                 Path(workspace.repo),
-                "worktree", "remove", str(workspace.path),
+                "worktree",
+                "remove",
+                str(workspace.path),
                 "--force",
             )
         except Exception:
-            pass  # worktree already doesn't exist in git's view
+            pass  # worktree already gone
+
+        # Prune stale metadata (defensive)
+        try:
+            await self._run_git(Path(workspace.repo), "worktree", "prune")
+        except Exception:
+            pass
 
     @staticmethod
     async def _run_git(cwd: Path, *args: str) -> tuple[int, str, str]:
         proc = await asyncio.create_subprocess_exec(
-            WorkspaceManager._GIT, *args,
+            WorkspaceManager._GIT,
+            *args,
             cwd=str(cwd) if cwd.is_dir() else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

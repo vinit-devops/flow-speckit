@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from flow_speckit.plugins import discover_entry_points, discover_local_skills
-from flow_speckit.skills.base import SkillDefinition
 from flow_speckit.skills.registry import SkillRegistry
 
 skills_app = typer.Typer(
@@ -19,6 +16,26 @@ skills_app = typer.Typer(
     help="List registered skills with name, version, I/O types, tier, and provenance.",
 )
 console = Console()
+
+
+def build_skill_registry(root: Path) -> SkillRegistry:
+    """Build a fully-populated registry from entry points and local skills.
+
+    Shared facade used by the CLI, SkillHarness, and the workflow engine so
+    the discover-and-register loop lives in one place.
+    """
+    registry = SkillRegistry()
+    for name, fn in discover_entry_points("flow_speckit.skills"):
+        try:
+            registry.register(fn, provenance=f"package:{name}")
+        except RuntimeError as exc:
+            pass  # logged by registry itself
+    for fn in discover_local_skills(root):
+        try:
+            registry.register(fn, provenance=f"local:{root / 'skills'}")
+        except RuntimeError as exc:
+            pass
+    return registry
 
 
 @skills_app.command("list")
@@ -30,27 +47,13 @@ def list_skills(
         help="Repository root (for local ./skills/ discovery).",
     ),
 ) -> None:
-    """Show every registered skill with name, version, I/O types, tier, and
-    provenance (package vs local path)."""
-    registry = SkillRegistry()
-
-    # 1. Entry-point skills (installed packages)
-    for name, fn in discover_entry_points("flow_speckit.skills"):
-        try:
-            registry.register(fn, provenance=f"package:{name}")
-        except RuntimeError as exc:
-            console.print(f"[yellow]Warning:[/yellow] {exc}")
-
-    # 2. Project-local skills (./skills/*.py)
-    for fn in discover_local_skills(root):
-        try:
-            registry.register(fn, provenance=f"local:{root / 'skills'}")
-        except RuntimeError as exc:
-            console.print(f"[yellow]Warning:[/yellow] {exc}")
-
+    """Show every registered skill with name, version, I/O types, tier, and provenance."""
+    registry = build_skill_registry(root)
     definitions = registry.list_all()
     if not definitions:
-        console.print("[dim]No skills registered. Add @skill functions or install a skill pack.[/dim]")
+        console.print(
+            "[dim]No skills registered. Add @skill functions or install a skill pack.[/dim]"
+        )
         return
 
     table = Table(title="Registered Skills")

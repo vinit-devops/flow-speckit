@@ -4,18 +4,31 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class LLMConfig(BaseModel):
+    """Nested ``[llm]`` section (doc 06 §2)."""
+
+    tiers: dict[str, str] = Field(default_factory=dict)
+    overrides: dict[str, str] = Field(default_factory=dict)
+    default_max_usd_per_run: float = 25.0
+
+
+class ExecutionConfig(BaseModel):
+    """Nested ``[execution]`` section (doc 05)."""
+
+    backend: str = "local_shell"
+    command: str | None = None
 
 
 class FlowSpeckitSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FLOW_SPECKIT_")
 
     database_url: str | None = None
-    llm_tiers: dict[str, str] = {}
-    llm_tier_overrides: dict[str, str] = {}
-    llm_budget_max_usd_per_run: float = 25.0
-    execution_backend: str = "local_shell"
-    execution_command: str | None = None
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
     @classmethod
     def load(cls, root: Path | None = None) -> FlowSpeckitSettings:
@@ -29,27 +42,37 @@ class FlowSpeckitSettings(BaseSettings):
                 raise ValueError(
                     f"invalid TOML in config file {config_path}: {exc}"
                 ) from exc
+
             # database
-            url = data.get("database", {}).get("url")
-            if url:
-                toml_values["database_url"] = url
-            # llm (doc 06 §2)
-            llm_cfg = data.get("llm", {})
-            if "tiers" in llm_cfg:
-                toml_values["llm_tiers"] = dict(llm_cfg["tiers"])
-            if "tiers" in llm_cfg and "overrides" in llm_cfg.get("tiers", {}):
-                toml_values["llm_tier_overrides"] = dict(llm_cfg["tiers"]["overrides"])
-            budget = llm_cfg.get("budget", {})
-            if "default_max_usd_per_run" in budget:
-                toml_values["llm_budget_max_usd_per_run"] = float(
-                    budget["default_max_usd_per_run"]
-                )
+            db_url = data.get("database", {}).get("url")
+            if db_url:
+                toml_values["database_url"] = db_url
+
+            # llm (doc 06 §2) — parsed as a nested model so [llm.tiers.overrides]
+            # stays structurally separate from the tier map.
+            llm_raw = data.get("llm", {})
+            if llm_raw:
+                tiers = dict(llm_raw.get("tiers", {}))
+                overrides = dict(llm_raw.get("overrides", {}))
+                budget = llm_raw.get("budget", {})
+                default_max = float(budget.get("default_max_usd_per_run", 25.0))
+                llm_inline: dict[str, Any] = {}
+                llm_inline["tiers"] = tiers
+                llm_inline["overrides"] = overrides
+                llm_inline["default_max_usd_per_run"] = default_max
+                toml_values["llm"] = llm_inline
+
             # execution
-            exec_cfg = data.get("execution", {})
-            if "backend" in exec_cfg:
-                toml_values["execution_backend"] = exec_cfg["backend"]
-            if "local_shell" in exec_cfg and "command" in exec_cfg["local_shell"]:
-                toml_values["execution_command"] = exec_cfg["local_shell"]["command"]
+            exec_raw = data.get("execution", {})
+            if exec_raw:
+                exec_inline: dict[str, Any] = {}
+                if "backend" in exec_raw:
+                    exec_inline["backend"] = exec_raw["backend"]
+                if "local_shell" in exec_raw and "command" in exec_raw["local_shell"]:
+                    exec_inline["command"] = exec_raw["local_shell"]["command"]
+                if exec_inline:
+                    toml_values["execution"] = exec_inline
+
         # Per-field precedence: env wins for any field it sets, toml fills the
         # rest. Init kwargs outrank env vars in pydantic-settings, so only
         # pass toml values for fields the environment did NOT set.

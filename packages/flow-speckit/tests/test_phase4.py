@@ -214,7 +214,7 @@ class TestSkillRegistry:
             pass
 
         reg.register(a_fn, provenance="package:skills-a")
-        with pytest.raises(RuntimeError, match="Skill name collision"):
+        with pytest.raises(RuntimeError, match="already registered from"):
             reg.register(b_fn, provenance="package:skills-b")
 
     def test_list_all_sorted(self):
@@ -388,9 +388,9 @@ class TestConfig:
     def test_default_values(self):
         settings = FlowSpeckitSettings()
         assert settings.database_url is None
-        assert settings.llm_tiers == {}
-        assert settings.llm_budget_max_usd_per_run == 25.0
-        assert settings.execution_backend == "local_shell"
+        assert settings.llm.tiers == {}
+        assert settings.llm.default_max_usd_per_run == 25.0
+        assert settings.execution.backend == "local_shell"
 
     def test_load_from_toml(self, tmp_path):
         toml_path = tmp_path / "flow-speckit.toml"
@@ -409,9 +409,9 @@ backend = "local_shell"
         )
         settings = FlowSpeckitSettings.load(root=tmp_path)
         assert settings.database_url == "postgresql://localhost/test"
-        assert settings.llm_tiers["fast"] == "anthropic/claude-haiku-4-5"
-        assert settings.llm_budget_max_usd_per_run == 50.0
-        assert settings.execution_backend == "local_shell"
+        assert settings.llm.tiers["fast"] == "anthropic/claude-haiku-4-5"
+        assert settings.llm.default_max_usd_per_run == 50.0
+        assert settings.execution.backend == "local_shell"
 
 
 # ==========================================================================
